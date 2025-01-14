@@ -1,12 +1,27 @@
 from tkinter import *
 from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
+import requests
 import serial
 import serial.tools.list_ports
 import threading
 import queue
 import datetime
 from openpyxl import Workbook
+
+__version_ = '1.0.0'
+
+
+def check_for_update():
+    try:
+        response = requests.get("https://github.com/906168212/SprayMonitorSystem/blob/master/version.json")
+        if response.status_code == 200:
+            data = response.text
+            print(data)
+            #latest_version = data['latest_version']
+            #print(latest_version)
+    except Exception as e:
+        print(f"检查更新失败：{e}")
 
 
 class Concert(Frame):
@@ -26,7 +41,8 @@ class Concert(Frame):
         self.baudrate_list = ['9600', '19200', '38400', '57600', '115200']
         self.send_queue = queue.Queue()  # 创建发送任务队列
         self.xlsx_name = ''
-        self.verison = 'V1.1.0'
+        check_for_update()
+        self.version = 'V1.1.0'
         self.createWidget()
         self.excel_init()
 
@@ -462,8 +478,8 @@ class Concert(Frame):
         ########### 状态栏 ############
         self.version_label = Label(bottom_f, text='Version:', font=('黑体', 15))
         self.version_label.pack(side='left')
-        self.verison_currently = Label(bottom_f, text=self.verison, font=('黑体', 15))
-        self.verison_currently.pack(side='left')
+        self.version_currently = Label(bottom_f, text=self.version, font=('黑体', 15))
+        self.version_currently.pack(side='left')
 
         ########### 显示信息、数据处理 ###########
         self.message_display('界面加载完成！', 'green')
