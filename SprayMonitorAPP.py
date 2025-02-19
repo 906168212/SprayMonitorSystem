@@ -1,7 +1,6 @@
 from tkinter import *
 from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
-import requests
 import serial
 import serial.tools.list_ports
 import threading
@@ -9,28 +8,17 @@ import queue
 import datetime
 from openpyxl import Workbook
 
-__version_ = '1.0.0'
-
-
-def check_for_update():
-    try:
-        response = requests.get("https://github.com/906168212/SprayMonitorSystem/blob/master/version.json")
-        if response.status_code == 200:
-            data = response.text
-            print(data)
-            #latest_version = data['latest_version']
-            #print(latest_version)
-    except Exception as e:
-        print(f"检查更新失败：{e}")
-
 
 class Concert(Frame):
     '''初始化'''
 
     def __init__(self, master=None):
         super().__init__(master)
+        self.current_version = '1.1.0'
         self.master = master
         self.pack()
+        # 窗口关闭事件绑定
+        root.protocol("WM_DELETE_WINDOW",self.on_closing)
         self.window_width = 900
         self.window_height = 600
         self.ser = None
@@ -40,9 +28,12 @@ class Concert(Frame):
         self.port_list = ['']
         self.baudrate_list = ['9600', '19200', '38400', '57600', '115200']
         self.send_queue = queue.Queue()  # 创建发送任务队列
+        self.message_queue = queue.Queue()  # 窗口显示改为定时器批量显示，且放入消息队列中以此显示
+        self.after_id = None
+        self.MESSAGE_UPDATE_TIME = 200  # 200ms 更新一次界面
         self.xlsx_name = ''
-        check_for_update()
-        self.version = 'V1.1.0'
+        self.data_cache = []
+        self.max_cache_size = 100  # 每100条CAN数据保存一次xlsx
         self.createWidget()
         self.excel_init()
 
@@ -67,8 +58,24 @@ class Concert(Frame):
     def save_can_info(self, can_info):
         timestamp = datetime.datetime.now()  # 获取当前时间
         can_info = [timestamp] + can_info
-        self.worksheet.append(can_info)
-        self.workbook.save(self.xlsx_name)  # 保存工作薄
+        # self.worksheet.append(can_info)
+        self.data_cache.append(can_info)
+        # 批量保存
+        if len(self.data_cache) >= self.max_cache_size:
+            for row in self.data_cache:
+                self.worksheet.append(row)
+            self.workbook.save(self.xlsx_name)  # 保存工作薄
+            self.data_cache = []
+
+    # 窗口关闭时执行一些操作：
+    def on_closing(self):
+        if len(self.data_cache) > 0:
+            for row in self.data_cache:
+                self.worksheet.append(row)
+            self.workbook.save(self.xlsx_name)  # 保存工作��
+            # 其他关闭操作
+            # 确保窗口被正确关闭
+            root.destroy()
 
     '''接收线程'''
 
@@ -77,8 +84,8 @@ class Concert(Frame):
         while self.runing:
             try:
                 with self.serial_lock:  # 锁住串口线程，保证线程安全
-                    if self.ser and self.ser.in_waiting:
-                        buffer += self.ser.read(self.ser.in_waiting)
+                    if self.ser and self.ser.in_waiting >= 16:  # 至少读取一个完整帧
+                        buffer += self.ser.read(16 * (self.ser.in_waiting // 16))
                 while len(buffer) >= 16:
                     if buffer[0] == 0xAA:
                         message = buffer[:16]  # 提取完整信息
@@ -129,11 +136,14 @@ class Concert(Frame):
             '''根据CANID，解析数据'''
             match can_id:  # 流量数据，定义传过来的数据是计数值，需要进行转换为流量值
                 case '00aa0401':
-                    # hex_data[16:]中为8路流量数据，要先提取出来,成为8个元素的数组,拿到前五个元素
+                    # hex_data[16:]中为8路流量数据，要先提取出来,成为8个元素的数组,拿到前6个元素
                     flow_data_array = [int(data[i:i + 2], 16) for i in range(0, len(data), 2)]
                     flow_values = [i / 25 for i in flow_data_array]
-                    # 管路流量1L=596脉冲 则流量L/min=每秒脉冲数/596 * 1 * 60
-                    flow_values[5] = flow_data_array[5] / 596 * 60
+                    # 喷头处流量 公式有Q = 【F+10】/108
+                    for i in range(len(flow_data_array) - 3):
+                        flow_values[i] = (flow_data_array[i] + 10) / 108
+                    # 管路流量1L=596脉冲 瞬时流量特性F=[10Q-4]
+                    flow_values[5] = (flow_data_array[5] + 4) / 10
                     # 公式转换为流量 保留2位小数,放入self.flow_volumes进行显示
                     for i in range(len(flow_data_array) - 3):
                         self.flow_volumes[i].set(f'{flow_values[i]:.2f}')
@@ -273,13 +283,38 @@ class Concert(Frame):
     '''文本框显示'''
 
     def message_display(self, message, color=None):
+        # 向队列添加消息
+        self.message_queue.put((message, color))
+        if not self.after_id:
+            self.after_id = self.after(self.MESSAGE_UPDATE_TIME, self.process_message_queue)
+        # self.message_box.config(state='normal')  # 使文本框可编辑
+        # if color is None:
+        #     color = 'black'
+        # self.message_box.tag_config(color, foreground=color)
+        # self.message_box.insert(END, '★' + str(datetime.datetime.now()) + ': ' + message + '\n', color)  # 插入消息
+        # self.message_box.see(END)  # 使文本框始终在最下面
+        # self.message_box.config(state='disabled')  # 禁止编辑
+
+    '''信息队列处理'''
+
+    def process_message_queue(self):
+        batch_size = 20  # 每次最多处理20条
         self.message_box.config(state='normal')  # 使文本框可编辑
-        if color is None:
-            color = 'black'
-        self.message_box.tag_config(color, foreground=color)
-        self.message_box.insert(END, '★' + str(datetime.datetime.now()) + ': ' + message + '\n', color)  # 插入消息
-        self.message_box.see(END)  # 使文本框始终在最下面
-        self.message_box.config(state='disabled')  # 禁止编辑
+        try:
+            for _ in range(batch_size):
+                try:
+                    msg, color = self.message_queue.get_nowait()
+                    if color is None:
+                        color = 'black'
+                    self.message_box.tag_config(color, foreground=color)
+                    self.message_box.insert(END, f'★{datetime.datetime.now()}: {msg}\n', color)
+                except queue.Empty:
+                    break
+            self.message_box.see(END)  # 使文本框始终在最下面
+        finally:
+            self.message_box.config(state='disabled')  # 禁止编辑
+            self.after_id = None if self.message_queue.empty() else self.after(self.MESSAGE_UPDATE_TIME,
+                                                                               self.process_message_queue)
 
     '''切换自动发送流量flag'''
 
@@ -478,7 +513,7 @@ class Concert(Frame):
         ########### 状态栏 ############
         self.version_label = Label(bottom_f, text='Version:', font=('黑体', 15))
         self.version_label.pack(side='left')
-        self.version_currently = Label(bottom_f, text=self.version, font=('黑体', 15))
+        self.version_currently = Label(bottom_f, text=self.current_version, font=('黑体', 15))
         self.version_currently.pack(side='left')
 
         ########### 显示信息、数据处理 ###########
@@ -490,6 +525,6 @@ class Concert(Frame):
 if __name__ == '__main__':
     root = Tk()
     root.geometry('900x600')  # 窗口大小
-    root.title('果树生物量在线采集软件')
+    root.title('喷雾数据在线监控系统')
     app = Concert(root)
     root.mainloop()
