@@ -14,7 +14,7 @@ class Concert(Frame):
 
     def __init__(self, master=None):
         super().__init__(master)
-        self.current_version = '1.1.0'
+        self.current_version = '1.2.0'
         self.master = master
         self.pack()
         # 窗口关闭事件绑定
