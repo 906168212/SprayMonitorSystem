@@ -14,7 +14,7 @@ class Concert(Frame):
 
     def __init__(self, master=None):
         super().__init__(master)
-        self.current_version = '1.2.0'
+        self.current_version = '1.3.0'
         self.master = master
         self.pack()
         # 窗口关闭事件绑定
@@ -22,7 +22,7 @@ class Concert(Frame):
         self.window_width = 900
         self.window_height = 600
         self.ser = None
-        self.runing = False
+        self.running = False
         self.auto_read_flow_flag = True
         self.serial_lock = threading.Lock()  # 创建串口线程锁，保证收发数据的正常
         self.port_list = ['']
@@ -31,9 +31,15 @@ class Concert(Frame):
         self.message_queue = queue.Queue()  # 窗口显示改为定时器批量显示，且放入消息队列中以此显示
         self.after_id = None
         self.MESSAGE_UPDATE_TIME = 200  # 200ms 更新一次界面
+
+        self.excel_data_queue = queue.Queue()  # excel数据存储队列，避免主线程阻塞
+        self.saver_thread = None  # 后台保存线程句柄
+        self.running_saver = False  # 保存线程运行标志
+        self.save_lock = threading.Lock()  # Excel保存锁
+
         self.xlsx_name = ''
-        self.data_cache = []
-        self.max_cache_size = 100  # 每100条CAN数据保存一次xlsx
+        # self.data_cache = []
+        # self.max_cache_size = 100  # 每100条CAN数据保存一次xlsx
         self.createWidget()
         self.excel_init()
 
@@ -56,32 +62,67 @@ class Concert(Frame):
             messagebox.showerror('Error', '初始化Excel时出错：' + str(e))
 
     def save_can_info(self, can_info):
-        timestamp = datetime.datetime.now()  # 获取当前时间
-        can_info = [timestamp] + can_info
-        # self.worksheet.append(can_info)
-        self.data_cache.append(can_info)
-        # 批量保存
-        if len(self.data_cache) >= self.max_cache_size:
-            for row in self.data_cache:
-                self.worksheet.append(row)
-            self.workbook.save(self.xlsx_name)  # 保存工作薄
-            self.data_cache = []
+        try:
+            timestamp = datetime.datetime.now()  # 获取当前时间
+            self.excel_data_queue.put((timestamp,can_info))
+        except Exception as e:
+            self.message_display(f"保存数据到队列失败：{str(e)}",'red')
+    '''excel 后台保存线程'''
+    def saver_thread_func(self):
+        buffer = []
+        buffer_max = 100
+        while self.running_saver or not self.excel_data_queue.empty():
+            try:
+                # 非阻塞获取数据，最多等待1秒
+                item = self.excel_data_queue.get(timeout=1)
+                timestamp,can_info = item
+                buffer.append([timestamp]+can_info)
+                if len(buffer) >= buffer_max:
+                    self._save_to_excel(buffer)
+                    buffer = []
+            except queue.Empty:
+                # 超时后检查是否需要退出
+                if not self.running_saver:
+                    break;
+            except Exception as e:
+                self.message_display(f'后台保存出错：{str(e)}','red')
+        # 退出前保存剩余数据
+        if buffer:
+            self.message_display('串口已关闭，进行剩余数据保存...','blue')
+            self._save_to_excel(buffer)
 
-    # 窗口关闭时执行一些操作：
+    '''私有方法执行实际保存操作'''
+    def _save_to_excel(self,data_buffer):
+        try:
+            with self.save_lock:  # 锁住Excel线程，保证线程安全
+                for row in data_buffer:
+                    self.worksheet.append(row)
+                self.workbook.save(self.xlsx_name)  # 保存
+                self.message_display(f'成功保存{len(data_buffer)}条数据','green')
+        except PermissionError:
+            self.message_display(f"Excel文件被占用，请关闭已打开的文件！",'red')
+        except Exception as e:
+            self.message_display(f"Excel后台保存数据时出错：{str(e)}",'red')
+    '''窗口关闭时执行一些操作'''
     def on_closing(self):
-        if len(self.data_cache) > 0:
-            for row in self.data_cache:
-                self.worksheet.append(row)
-            self.workbook.save(self.xlsx_name)  # 保存工作��
+        # 关闭串口，已经关闭则无需再关闭
+        if self.running:
+            self.switch_serial_state()
+        if not self.excel_data_queue.empty():
+            self.message_display("正在保存剩余数据...", "blue")
+            self.running_saver = True  # 临时恢复标志让线程处理
+            self.saver_thread = threading.Thread(target=self.saver_thread_func(), daemon=True)
+            self.saver_thread.start()
+            self.saver_thread.join(timeout=10)  # 最多等待10秒
             # 其他关闭操作
-            # 确保窗口被正确关闭
-            root.destroy()
+        # 确保窗口被正确关闭
+        root.destroy()
 
     '''接收线程'''
 
     def receive_thread_func(self):
         buffer = b''  # 数据缓存
-        while self.runing:
+        while self.running:
             try:
                 with self.serial_lock:  # 锁住串口线程，保证线程安全
                     if self.ser and self.ser.in_waiting >= 16:  # 至少读取一个完整帧
@@ -99,7 +140,7 @@ class Concert(Frame):
                     else:
                         buffer = buffer[1:]  # 丢弃无效数据头部
             except Exception as e:
-                if self.runing:  # 仅在线程运行时显示错误
+                if self.running:  # 仅在线程运行时显示错误
                     self.message_display('接收数据时出错：' + str(e), 'red')
                     self.message_display('================================')
                     messagebox.showerror('Error', '接收数据时出错：' + str(e))
@@ -108,7 +149,7 @@ class Concert(Frame):
     '''发送线程'''
 
     def send_thread_func(self):
-        while self.runing:
+        while self.running:
             try:
                 if not self.send_queue.empty():
                     send_data = self.send_queue.get()
@@ -121,7 +162,7 @@ class Concert(Frame):
                     self.message_display('发送：' + send_data_str)
                     self.send_queue.task_done()  # 任务完成，任务队列出队
             except Exception as e:
-                if self.runing:  # 仅在线程运行时显示错误
+                if self.running:  # 仅在线程运行时显示错误
                     self.message_display('发送数据时出错：' + str(e), 'red')
                     self.message_display('================================')
                     messagebox.showerror('Error', '发送数据时出错：' + str(e))
@@ -180,7 +221,7 @@ class Concert(Frame):
                 self.message_display('串口打开！串口号：' + self.port_var.get() + ', 波特率：' + self.baudrate_var.get(),
                                      'green')
                 # 接收/发送线程打开
-                self.runing = True
+                self.running = True
                 # 接收线程打开
                 self.receive_thread = threading.Thread(target=self.receive_thread_func, daemon=True)
                 self.receive_thread.start()
@@ -189,6 +230,11 @@ class Concert(Frame):
                 self.send_thread = threading.Thread(target=self.send_thread_func, daemon=True)
                 self.send_thread.start()
                 self.message_display('发送线程打开！', 'green')
+                # excel后台线程打开
+                self.running_saver = True
+                self.saver_thread = threading.Thread(target=self.saver_thread_func, daemon=True)
+                self.saver_thread.start()
+                self.message_display('Excel后台保存线程已启动','green')
                 # 启动1S定时器
                 self.one_second_timer()
                 self.message_display('流量监测定时打开-1S', 'green')
@@ -204,16 +250,20 @@ class Concert(Frame):
                     messagebox.showerror('Error', '未知错误：' + str(e))
                 return
         else:
-            self.runing = False
+            self.running = False
+            self.running_saver = False
             # 等待线程结束
-            if self.receive_thread.is_alive():
+            if self.receive_thread and self.receive_thread.is_alive():
                 self.receive_thread.join(timeout=1)
-            self.message_display('接收线程关闭！', 'red')
-            if self.send_thread.is_alive():
-                self.send_thread.join()
-            self.message_display('发送线程关闭！', 'red')
+                self.message_display('接收线程关闭！', 'red')
+            if self.send_thread and self.send_thread.is_alive():
+                self.send_thread.join(timeout=1)
+                self.message_display('发送线程关闭！', 'red')
+            if self.saver_thread and self.saver_thread.is_alive():
+                self.saver_thread.join(timeout=1)
+                self.message_display('Excel后台保存线程已停止!', 'red')
             # 确保串口不被占用时再关闭
-            if self.ser.is_open:
+            if self.ser and self.ser.is_open:
                 self.ser.close()
             self.message_display('串口关闭！', 'red')
             self.message_display('================================')
@@ -244,9 +294,14 @@ class Concert(Frame):
     def set_frequency(self, freq):
         # 发送十六进制信息，格式为aa010008+4字节CANID+8字节数据，例如AA0100081F0000000000000000000000
         # 将freq str转换为int，然后转换为2字节的16进制，并拆分为高低字节位，用于放入send_data的数组中
-        freq = 10 * int(freq)
-        self.message_display('设置电磁阀频率为：' + str(freq / 10) + 'Hz', 'green')
-        freq_high_low = [(freq >> 8) & 0xFF, freq & 0xFF]
+        # 当用户输入非数字时会导致程序崩溃，因此应该进行验证
+        try:
+            freq_val = 10 * int(freq)
+        except ValueError:
+            self.message_display("错误：请输入有效的数字",'red')
+            return
+        self.message_display('设置电磁阀频率为：' + str(freq_val / 10) + 'Hz', 'green')
+        freq_high_low = [(freq_val >> 8) & 0xFF, freq_val & 0xFF]
         send_data = [0xAA, 0x01, 0x00, 0x08, 0x1F, 0x00, 0x00, 0x00, freq_high_low[0], freq_high_low[1], 0x00, 0x00,
                      0x00, 0x00, 0x00, 0x00]
         self.send_queue.put(send_data)  # 将发送任务放入队列
@@ -254,9 +309,13 @@ class Concert(Frame):
     '''设置占空比和相位'''
 
     def set_duty_phase(self, channel, duty, phase):
-        channel = int(channel)
-        duty = 10 * int(duty)
-        phase = 10 * int(phase)
+        try:
+            channel = int(channel)
+            duty = 10 * int(duty)
+            phase = 10 * int(phase)
+        except ValueError:
+            self.message_display("错误：请输入有效的数字",'red')
+            return
         self.message_display(
             '设置 ' + str(channel) + ' 号电磁阀：占空比：' + str(duty / 10) + '%，相位：' + str(phase / 10) + '°', 'green')
         duty_high_low = [(duty >> 8) & 0xFF, duty & 0xFF]
@@ -268,7 +327,7 @@ class Concert(Frame):
     '''读取脉冲计数值'''
 
     def read_flow_values(self):
-        if not (self.runing and self.auto_read_flow_flag):
+        if not (self.running and self.auto_read_flow_flag):
             return
         self.one_second_timer()
         send_data = [0xAA, 0x01, 0x00, 0x08, 0x00, 0xAA, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
@@ -277,6 +336,9 @@ class Concert(Frame):
     '''1S 定时器'''
 
     def one_second_timer(self):
+        # 定时器可能堆积，导致多个并发定时器运行,在启动新定时器前取消旧的
+        if hasattr(self,'timer') and self.timer.is_alive():
+            self.timer.cancel()
         self.timer = threading.Timer(1, self.read_flow_values)
         self.timer.start()
 
@@ -287,13 +349,6 @@ class Concert(Frame):
         self.message_queue.put((message, color))
         if not self.after_id:
             self.after_id = self.after(self.MESSAGE_UPDATE_TIME, self.process_message_queue)
-        # self.message_box.config(state='normal')  # 使文本框可编辑
-        # if color is None:
-        #     color = 'black'
-        # self.message_box.tag_config(color, foreground=color)
-        # self.message_box.insert(END, '★' + str(datetime.datetime.now()) + ': ' + message + '\n', color)  # 插入消息
-        # self.message_box.see(END)  # 使文本框始终在最下面
-        # self.message_box.config(state='disabled')  # 禁止编辑
 
     '''信息队列处理'''
 
@@ -520,6 +575,8 @@ class Concert(Frame):
         self.message_display('界面加载完成！', 'green')
         self.message_display('================================')
         self.get_port_list()
+
+
 
 
 if __name__ == '__main__':
