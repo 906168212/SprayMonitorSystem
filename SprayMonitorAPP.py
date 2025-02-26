@@ -1,17 +1,13 @@
 from tkinter import *
 from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
-import serial,serial.tools.list_ports,threading,queue,datetime,requests,json,subprocess
-import os,shutil
+import serial
+import serial.tools.list_ports
+import threading
+import queue
+import datetime
+import json
 from openpyxl import Workbook
-
-
-def get_remote_version():
-    url = 'https://raw.githubusercontent.com/906168212/SprayMonitorSystem/master/version.json'
-    response = requests.get(url)
-    if response.status_code == 200:
-        return json.loads(response.text)['latest_version']
-    return None
 
 
 def get_local_version():
@@ -22,53 +18,11 @@ def get_local_version():
         return '0.0.0'
 
 
-def check_for_updates():
-    remote_version = get_remote_version()
-    local_version = get_local_version()
-    if remote_version and remote_version > local_version:
-        return True
-    return False
-
-
-def download_file(url, local_filename):
-    with requests.get(url, stream=True) as r:
-        r.raise_for_status()
-        with open(local_filename, 'wb') as f:
-            for chunk in r.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-
-
-def package_to_exe():
-    subprocess.call(
-        ['pyinstaller', '-w', '-F', '-i', './logo/logo.ico', '--name', 'SprayMonitorAPP', 'SprayMonitor.py'])
-
-
-def replace_old_exe():
-    if os.path.exists("dist/SprayMonitorAPP.exe"):
-        if os.path.exists('SprayMonitorAPP.exe'):
-            os.remove('SprayMonitorAPP.exe')
-        shutil.move('dist/SprayMonitorAPP.exe','.')
-        shutil.rmtree('dist')
-        shutil.rmtree('build')
-        os.remove('SprayMonitorAPP.spec')
-
-
-def download_latest_code():
-    url = 'https://raw.githubusercontent.com/906168212/SprayMonitorSystem/master/SprayMonitorAPP.py'
-    download_file(url, 'SprayMonitor.py')
-
-
 class Concert(Frame):
     """初始化"""
 
     def __init__(self, master=None):
         super().__init__(master)
-        self.remote_version = None
-        # 检查更新
-        if check_for_updates():
-            print('需要更新')
-            download_latest_code()
         # 1s定时器
         self.timer = None
         # 串口
