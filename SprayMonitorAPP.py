@@ -1,47 +1,122 @@
 from tkinter import *
 from tkinter import messagebox
 from tkinter.scrolledtext import ScrolledText
-import serial
-import serial.tools.list_ports
-import threading
-import queue
-import datetime
+import serial,serial.tools.list_ports,threading,queue,datetime,requests,json,subprocess
+import os,shutil
 from openpyxl import Workbook
 
 
+def get_remote_version():
+    url = 'https://raw.githubusercontent.com/906168212/SprayMonitorSystem/master/version.json'
+    response = requests.get(url)
+    if response.status_code == 200:
+        return json.loads(response.text)['latest_version']
+    return None
+
+
+def get_local_version():
+    try:
+        with open('version.json', 'r') as f:
+            return json.load(f)['latest_version']
+    except FileNotFoundError:
+        return '0.0.0'
+
+
+def check_for_updates():
+    remote_version = get_remote_version()
+    local_version = get_local_version()
+    if remote_version and remote_version > local_version:
+        return True
+    return False
+
+
+def download_file(url, local_filename):
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(local_filename, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+
+
+def package_to_exe():
+    subprocess.call(
+        ['pyinstaller', '-w', '-F', '-i', './logo/logo.ico', '--name', 'SprayMonitorAPP', 'SprayMonitor.py'])
+
+
+def replace_old_exe():
+    if os.path.exists("dist/SprayMonitorAPP.exe"):
+        if os.path.exists('SprayMonitorAPP.exe'):
+            os.remove('SprayMonitorAPP.exe')
+        shutil.move('dist/SprayMonitorAPP.exe','.')
+        shutil.rmtree('dist')
+        shutil.rmtree('build')
+        os.remove('SprayMonitorAPP.spec')
+
+
+def download_latest_code():
+    url = 'https://raw.githubusercontent.com/906168212/SprayMonitorSystem/master/SprayMonitorAPP.py'
+    download_file(url, 'SprayMonitor.py')
+
+
 class Concert(Frame):
-    '''初始化'''
+    """初始化"""
 
     def __init__(self, master=None):
         super().__init__(master)
-        self.current_version = '1.3.0'
-        self.master = master
-        self.pack()
-        # 窗口关闭事件绑定
-        root.protocol("WM_DELETE_WINDOW",self.on_closing)
-        self.window_width = 900
-        self.window_height = 600
+        self.remote_version = None
+        # 检查更新
+        if check_for_updates():
+            print('需要更新')
+            download_latest_code()
+        # 1s定时器
+        self.timer = None
+        # 串口
         self.ser = None
-        self.running = False
-        self.auto_read_flow_flag = True
-        self.serial_lock = threading.Lock()  # 创建串口线程锁，保证收发数据的正常
-        self.port_list = ['']
+        self.running_ser = False  # 串口运行标志
+        self.port_list = ['']  # 串口列表
         self.baudrate_list = ['9600', '19200', '38400', '57600', '115200']
+        self.port_var = StringVar()  # 串口Var句柄
+        self.port_choose = None
+        self.baudrate_var = StringVar()  # 串口波特率句柄
+        self.baudrate_choose = None
+        self.serial_button = None
+        self.refresh_button = None
+        self.flow_volumes = []
+        self.channel_flow_var = StringVar()  # 管路流量句柄
+        self.pressure_var = StringVar()  # 管路压力句柄
+        self.set_freq_button = None
+        self.set_duty_phase_button = None
+        self.message_box = None
         self.send_queue = queue.Queue()  # 创建发送任务队列
+        self.receive_thread = None  # 串口接收后台线程句柄
+        self.send_thread = None  # 串口发送后台线程句柄
+        self.serial_lock = threading.Lock()  # 创建串口线程锁，保证收发数据的正常
+        # 自动发送读取流量CAN指令
+        self.auto_read_flow_flag = True
+        # 信息显示
         self.message_queue = queue.Queue()  # 窗口显示改为定时器批量显示，且放入消息队列中以此显示
         self.after_id = None
         self.MESSAGE_UPDATE_TIME = 200  # 200ms 更新一次界面
-
+        # excel
         self.excel_data_queue = queue.Queue()  # excel数据存储队列，避免主线程阻塞
-        self.saver_thread = None  # 后台保存线程句柄
+        self.saver_thread = None  # excel后台保存线程句柄
         self.running_saver = False  # 保存线程运行标志
         self.save_lock = threading.Lock()  # Excel保存锁
-
         self.xlsx_name = ''
-        # self.data_cache = []
-        # self.max_cache_size = 100  # 每100条CAN数据保存一次xlsx
-        self.createWidget()
+        self.workbook = None
+        self.worksheet = None
+        # 主界面
+        self.window_width = 900
+        self.window_height = 600
+        self.master = master
+        self.pack()
+        root.protocol("WM_DELETE_WINDOW", self.on_closing)  # 窗口关闭事件绑定
+        self.create_widget()  # 界面组件创建
+        # excel初始化
         self.excel_init()
+
+    '''更新系统'''
 
     '''日志系统'''
 
@@ -64,10 +139,12 @@ class Concert(Frame):
     def save_can_info(self, can_info):
         try:
             timestamp = datetime.datetime.now()  # 获取当前时间
-            self.excel_data_queue.put((timestamp,can_info))
+            self.excel_data_queue.put((timestamp, can_info))
         except Exception as e:
-            self.message_display(f"保存数据到队列失败：{str(e)}",'red')
+            self.message_display(f"保存数据到队列失败：{str(e)}", 'red')
+
     '''excel 后台保存线程'''
+
     def saver_thread_func(self):
         buffer = []
         buffer_max = 100
@@ -75,38 +152,41 @@ class Concert(Frame):
             try:
                 # 非阻塞获取数据，最多等待1秒
                 item = self.excel_data_queue.get(timeout=1)
-                timestamp,can_info = item
-                buffer.append([timestamp]+can_info)
+                timestamp, can_info = item
+                buffer.append([timestamp] + can_info)
                 if len(buffer) >= buffer_max:
                     self._save_to_excel(buffer)
                     buffer = []
             except queue.Empty:
                 # 超时后检查是否需要退出
                 if not self.running_saver:
-                    break;
+                    break
             except Exception as e:
-                self.message_display(f'后台保存出错：{str(e)}','red')
+                self.message_display(f'后台保存出错：{str(e)}', 'red')
         # 退出前保存剩余数据
         if buffer:
-            self.message_display('串口已关闭，进行剩余数据保存...','blue')
+            self.message_display('串口已关闭，进行剩余数据保存...', 'blue')
             self._save_to_excel(buffer)
 
     '''私有方法执行实际保存操作'''
-    def _save_to_excel(self,data_buffer):
+
+    def _save_to_excel(self, data_buffer):
         try:
             with self.save_lock:  # 锁住Excel线程，保证线程安全
                 for row in data_buffer:
                     self.worksheet.append(row)
                 self.workbook.save(self.xlsx_name)  # 保存
-                self.message_display(f'成功保存{len(data_buffer)}条数据','green')
+                self.message_display(f'成功保存{len(data_buffer)}条数据', 'green')
         except PermissionError:
-            self.message_display(f"Excel文件被占用，请关闭已打开的文件！",'red')
+            self.message_display(f"Excel文件被占用，请关闭已打开的文件！", 'red')
         except Exception as e:
-            self.message_display(f"Excel后台保存数据时出错：{str(e)}",'red')
+            self.message_display(f"Excel后台保存数据时出错：{str(e)}", 'red')
+
     '''窗口关闭时执行一些操作'''
+
     def on_closing(self):
         # 关闭串口，已经关闭则无需再关闭
-        if self.running:
+        if self.running_ser:
             self.switch_serial_state()
         if not self.excel_data_queue.empty():
             self.message_display("正在保存剩余数据...", "blue")
@@ -122,7 +202,7 @@ class Concert(Frame):
 
     def receive_thread_func(self):
         buffer = b''  # 数据缓存
-        while self.running:
+        while self.running_ser:
             try:
                 with self.serial_lock:  # 锁住串口线程，保证线程安全
                     if self.ser and self.ser.in_waiting >= 16:  # 至少读取一个完整帧
@@ -140,7 +220,7 @@ class Concert(Frame):
                     else:
                         buffer = buffer[1:]  # 丢弃无效数据头部
             except Exception as e:
-                if self.running:  # 仅在线程运行时显示错误
+                if self.running_ser:  # 仅在线程运行时显示错误
                     self.message_display('接收数据时出错：' + str(e), 'red')
                     self.message_display('================================')
                     messagebox.showerror('Error', '接收数据时出错：' + str(e))
@@ -149,7 +229,7 @@ class Concert(Frame):
     '''发送线程'''
 
     def send_thread_func(self):
-        while self.running:
+        while self.running_ser:
             try:
                 if not self.send_queue.empty():
                     send_data = self.send_queue.get()
@@ -162,7 +242,7 @@ class Concert(Frame):
                     self.message_display('发送：' + send_data_str)
                     self.send_queue.task_done()  # 任务完成，任务队列出队
             except Exception as e:
-                if self.running:  # 仅在线程运行时显示错误
+                if self.running_ser:  # 仅在线程运行时显示错误
                     self.message_display('发送数据时出错：' + str(e), 'red')
                     self.message_display('================================')
                     messagebox.showerror('Error', '发送数据时出错：' + str(e))
@@ -221,7 +301,7 @@ class Concert(Frame):
                 self.message_display('串口打开！串口号：' + self.port_var.get() + ', 波特率：' + self.baudrate_var.get(),
                                      'green')
                 # 接收/发送线程打开
-                self.running = True
+                self.running_ser = True
                 # 接收线程打开
                 self.receive_thread = threading.Thread(target=self.receive_thread_func, daemon=True)
                 self.receive_thread.start()
@@ -234,7 +314,7 @@ class Concert(Frame):
                 self.running_saver = True
                 self.saver_thread = threading.Thread(target=self.saver_thread_func, daemon=True)
                 self.saver_thread.start()
-                self.message_display('Excel后台保存线程已启动','green')
+                self.message_display('Excel后台保存线程已启动', 'green')
                 # 启动1S定时器
                 self.one_second_timer()
                 self.message_display('流量监测定时打开-1S', 'green')
@@ -250,7 +330,7 @@ class Concert(Frame):
                     messagebox.showerror('Error', '未知错误：' + str(e))
                 return
         else:
-            self.running = False
+            self.running_ser = False
             self.running_saver = False
             # 等待线程结束
             if self.receive_thread and self.receive_thread.is_alive():
@@ -298,7 +378,7 @@ class Concert(Frame):
         try:
             freq_val = 10 * int(freq)
         except ValueError:
-            self.message_display("错误：请输入有效的数字",'red')
+            self.message_display("错误：请输入有效的数字", 'red')
             return
         self.message_display('设置电磁阀频率为：' + str(freq_val / 10) + 'Hz', 'green')
         freq_high_low = [(freq_val >> 8) & 0xFF, freq_val & 0xFF]
@@ -314,7 +394,7 @@ class Concert(Frame):
             duty = 10 * int(duty)
             phase = 10 * int(phase)
         except ValueError:
-            self.message_display("错误：请输入有效的数字",'red')
+            self.message_display("错误：请输入有效的数字", 'red')
             return
         self.message_display(
             '设置 ' + str(channel) + ' 号电磁阀：占空比：' + str(duty / 10) + '%，相位：' + str(phase / 10) + '°', 'green')
@@ -327,7 +407,7 @@ class Concert(Frame):
     '''读取脉冲计数值'''
 
     def read_flow_values(self):
-        if not (self.running and self.auto_read_flow_flag):
+        if not (self.running_ser and self.auto_read_flow_flag):
             return
         self.one_second_timer()
         send_data = [0xAA, 0x01, 0x00, 0x08, 0x00, 0xAA, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
@@ -337,7 +417,7 @@ class Concert(Frame):
 
     def one_second_timer(self):
         # 定时器可能堆积，导致多个并发定时器运行,在启动新定时器前取消旧的
-        if hasattr(self,'timer') and self.timer.is_alive():
+        if hasattr(self, 'timer') and self.timer.is_alive():
             self.timer.cancel()
         self.timer = threading.Timer(1, self.read_flow_values)
         self.timer.start()
@@ -383,17 +463,17 @@ class Concert(Frame):
 
     '''创建组件'''
 
-    def createWidget(self):
+    def create_widget(self):
 
-        '''框架区'''
+        """框架区"""
         # 标题框架
         title_f = Frame(root, width=self.window_width, borderwidth=1, relief='solid', padx=30, pady=10)
         title_f.pack()
         # 配置区框架
         config_f = Frame(root, width=self.window_width, padx=30)
-        self.config_serial_f = Frame(config_f)
+        config_serial_f = Frame(config_f)
         config_f.pack()
-        self.config_serial_f.pack(pady=5, padx=30, side='bottom', anchor='w')
+        config_serial_f.pack(pady=5, padx=30, side='bottom', anchor='w')
         # 传感器区框架
         sensor_data_f = Frame(root, width=self.window_width, padx=30)
         data_labels_f = Frame(sensor_data_f)
@@ -414,169 +494,166 @@ class Concert(Frame):
         bottom_f.pack(side='bottom', anchor='w')
 
         '''内容区'''
-        ########### 标题 ###########
-        self.title_label = Label(title_f, text='喷雾数据在线监控系统', font=('黑体', 25))
-        self.title_label.pack()
+        # 标题
+        title_label = Label(title_f, text='喷雾数据在线监控系统', font=('黑体', 25))
+        title_label.pack()
 
-        ########### 配置区，用于配置串口 ###########
+        # 配置区，用于配置串口
         # 分割线
-        self.config_label = Label(config_f,
-                                  text='配置---------------------------------------------------------------------------',
-                                  font=('黑体', 15))
-        self.config_label.pack()
+        config_label = Label(config_f,
+                             text='配置---------------------------------------------------------------------------',
+                             font=('黑体', 15))
+        config_label.pack()
         # 创建串口选择框、波特率选择框、打开/关闭按钮以及刷新按钮
         # 串口选择框
-        self.label_port = Label(self.config_serial_f, text='串口：', font=('黑体', 15))
-        self.label_port.pack(side='left')
-        self.port_var = StringVar()
-        self.port_choose = OptionMenu(self.config_serial_f, self.port_var, *self.port_list)
+        label_port = Label(config_serial_f, text='串口：', font=('黑体', 15))
+        label_port.pack(side='left')
+        self.port_choose = OptionMenu(config_serial_f, self.port_var, *self.port_list)
         self.port_choose.pack(side='left')
-        Label(self.config_serial_f, text='').pack(side='left', padx=10)
+        Label(config_serial_f, text='').pack(side='left', padx=10)
         # 波特率选择框
-        self.label_baudrate = Label(self.config_serial_f, text='波特率：', font=('黑体', 15))
-        self.label_baudrate.pack(side='left')
-        self.baudrate_var = StringVar()
+        label_baudrate = Label(config_serial_f, text='波特率：', font=('黑体', 15))
+        label_baudrate.pack(side='left')
+
         self.baudrate_var.set(self.baudrate_list[0])
-        self.baudrate_choose = OptionMenu(self.config_serial_f, self.baudrate_var, *self.baudrate_list)
+        self.baudrate_choose = OptionMenu(config_serial_f, self.baudrate_var, *self.baudrate_list)
         self.baudrate_choose.pack(side='left')
         # 串口开关按钮
-        self.serial_button = Button(self.config_serial_f, text='打开', font=('黑体', 13),
+        self.serial_button = Button(config_serial_f, text='打开', font=('黑体', 13),
                                     command=self.switch_serial_state)
         self.serial_button.pack(side='left', padx=30)
         # 刷新串口按钮
-        self.refresh_button = Button(self.config_serial_f, text='刷新串口', font=('黑体', 13),
+        self.refresh_button = Button(config_serial_f, text='刷新串口', font=('黑体', 13),
                                      command=self.get_port_list)
         self.refresh_button.pack(side='left')
 
-        ########### 传感器数据区，观测流量、压力数据 ###########
+        # 传感器数据区，观测流量、压力数据
         # 分割线
-        self.flow_data_label = Label(sensor_data_f,
-                                     text='传感器数据---------------------------------------------------------------------',
-                                     font=('黑体', 15))
-        self.flow_data_label.pack()
+        flow_data_label = Label(sensor_data_f,
+                                text='传感器数据---------------------------------------------------------------------',
+                                font=('黑体', 15))
+        flow_data_label.pack()
         # 创建2行3列 5个喷头流量，1个管路流量，1个管路压力
         # 流量5路
-        self.flow_labels = [Label(data_labels_f, font=('黑体', 15), text='流量{}:'.format(i + 1)) for i in range(5)]
+        flow_labels = [Label(data_labels_f, font=('黑体', 15), text='流量{}:'.format(i + 1)) for i in range(5)]
         self.flow_volumes = [StringVar() for _ in range(5)]
-        self.flow_volume_labels = [Label(data_labels_f, font=('黑体', 15), width=5, bg='white', relief='solid',
-                                         textvariable=self.flow_volumes[i]) for i in range(5)]
-        self.flow_units = [Label(data_labels_f, font=('黑体', 15), text='L/min') for _ in range(5)]
+        flow_volume_labels = [Label(data_labels_f, font=('黑体', 15), width=5, bg='white', relief='solid',
+                                    textvariable=self.flow_volumes[i]) for i in range(5)]
+        flow_units = [Label(data_labels_f, font=('黑体', 15), text='L/min') for _ in range(5)]
         # 管路流量
-        self.channel_flow_label = Label(data_labels_f, font=('黑体', 15), text='管路流量:')
-        self.channel_flow_var = StringVar()
-        self.channel_flow_data_label = Label(data_labels_f, font=('黑体', 15), textvariable=self.channel_flow_var,
-                                             bg='white', relief='solid', width=5)
-        self.channel_flow_unit = Label(data_labels_f, font=('黑体', 15), text='L/min')
+        channel_flow_label = Label(data_labels_f, font=('黑体', 15), text='管路流量:')
+        channel_flow_data_label = Label(data_labels_f, font=('黑体', 15), textvariable=self.channel_flow_var,
+                                        bg='white', relief='solid', width=5)
+        channel_flow_unit = Label(data_labels_f, font=('黑体', 15), text='L/min')
         # 管路压力
-        self.pressure_label = Label(data_labels_f, font=('黑体', 15), text='管路压力:')
-        self.pressure_var = StringVar()
-        self.pressure_data_label = Label(data_labels_f, font=('黑体', 15), textvariable=self.pressure_var, bg='white',
-                                         relief='solid', width=5)
-        self.pressure_unit = Label(data_labels_f, font=('黑体', 15), text='MPa  ')
+        pressure_label = Label(data_labels_f, font=('黑体', 15), text='管路压力:')
+
+        pressure_data_label = Label(data_labels_f, font=('黑体', 15), textvariable=self.pressure_var, bg='white',
+                                    relief='solid', width=5)
+        pressure_unit = Label(data_labels_f, font=('黑体', 15), text='MPa  ')
         # 网格配置
         for i in range(5):
-            self.flow_labels[i].grid(row=i // 3, column=i % 3 * 3)
-            self.flow_volume_labels[i].grid(row=i // 3, column=i % 3 * 3 + 1)
-            self.flow_units[i].grid(row=i // 3, column=i % 3 * 3 + 2, padx=3, pady=5)
+            flow_labels[i].grid(row=i // 3, column=i % 3 * 3)
+            flow_volume_labels[i].grid(row=i // 3, column=i % 3 * 3 + 1)
+            flow_units[i].grid(row=i // 3, column=i % 3 * 3 + 2, padx=3, pady=5)
             self.flow_volumes[i].set('0.00')
-        self.channel_flow_label.grid(row=2, column=0)
-        self.channel_flow_data_label.grid(row=2, column=1)
+        channel_flow_label.grid(row=2, column=0)
+        channel_flow_data_label.grid(row=2, column=1)
         self.channel_flow_var.set('0.00')
-        self.channel_flow_unit.grid(row=2, column=2, pady=5)
-        self.pressure_label.grid(row=2, column=3)
-        self.pressure_data_label.grid(row=2, column=4)
+        channel_flow_unit.grid(row=2, column=2, pady=5)
+        pressure_label.grid(row=2, column=3)
+        pressure_data_label.grid(row=2, column=4)
         self.pressure_var.set('0.00')
-        self.pressure_unit.grid(row=2, column=5, pady=5)
+        pressure_unit.grid(row=2, column=5, pady=5)
 
-        ########### 指令发送区，差相驱动板指令发送 ###########
+        # 指令发送区，差相驱动板指令发送
         # 分割线
-        self.order_divider_label = Label(order_f,
-                                         text='指令发送区---------------------------------------------------------------------',
-                                         font=('黑体', 15))
-        self.order_divider_label.pack()
+        order_divider_label = Label(order_f,
+                                    text='指令发送区---------------------------------------------------------------------',
+                                    font=('黑体', 15))
+        order_divider_label.pack()
         # 频率
-        self.freq_label = Label(order_freq_f, text='频率:', font=('黑体', 15))
-        self.freq_var = StringVar()
-        self.freq_entry = Entry(order_freq_f, font=('黑体', 15), textvariable=self.freq_var, bg='white', relief='solid',
-                                width=5, justify='center')
-        self.freq_unit = Label(order_freq_f, text='Hz', font=('黑体', 15))
-        self.freq_label.pack(side='left')
-        self.freq_entry.pack(side='left')
-        self.freq_unit.pack(side='left', padx=5)
-        self.freq_var.set('1')
+        freq_label = Label(order_freq_f, text='频率:', font=('黑体', 15))
+        freq_var = StringVar()
+        freq_entry = Entry(order_freq_f, font=('黑体', 15), textvariable=freq_var, bg='white', relief='solid',
+                           width=5, justify='center')
+        freq_unit = Label(order_freq_f, text='Hz', font=('黑体', 15))
+        freq_label.pack(side='left')
+        freq_entry.pack(side='left')
+        freq_unit.pack(side='left', padx=5)
+        freq_var.set('1')
         # 设置频率按钮
         self.set_freq_button = Button(order_freq_f, state='disabled', text='频率设置', font=('黑体', 13),
-                                      command=lambda: self.set_frequency(self.freq_entry.get()))
+                                      command=lambda: self.set_frequency(freq_entry.get()))
         self.set_freq_button.pack(side='left', padx=10)
         # 自动发送流量请求复选框
-        self.auto_send_flow_var = IntVar()
-        self.auto_send_flow_checkbutton = Checkbutton(order_freq_f, font=('黑体', 15), variable=self.auto_send_flow_var,
-                                                      text='主动发送流量读取指令', onvalue=1, offvalue=0,
-                                                      command=self.toggle_auto_read_flow)
-        self.auto_send_flow_checkbutton.pack(side='left', padx=5)
-        self.auto_send_flow_var.set(1)
+        auto_send_flow_var = IntVar()
+        auto_send_flow_checkbutton = Checkbutton(order_freq_f, font=('黑体', 15), variable=auto_send_flow_var,
+                                                 text='主动发送流量读取指令', onvalue=1, offvalue=0,
+                                                 command=self.toggle_auto_read_flow)
+        auto_send_flow_checkbutton.pack(side='left', padx=5)
+        auto_send_flow_var.set(1)
         # 通道号
-        self.duty_phase_channel_label = Label(order_duty_phase_f, text='通道:', font=('黑体', 15))
-        self.duty_phase_channel_var = StringVar()
-        self.duty_phase_channel_entry = Entry(order_duty_phase_f, font=('黑体', 15),
-                                              textvariable=self.duty_phase_channel_var, bg='white', relief='solid',
-                                              width=5, justify='center')
-        self.duty_phase_channel_unit = Label(order_duty_phase_f, text='号', font=('黑体', 15))
-        self.duty_phase_channel_label.pack(side='left')
-        self.duty_phase_channel_entry.pack(side='left')
-        self.duty_phase_channel_unit.pack(side='left', padx=5)
-        self.duty_phase_channel_var.set('1')
+        duty_phase_channel_label = Label(order_duty_phase_f, text='通道:', font=('黑体', 15))
+        duty_phase_channel_var = StringVar()
+        duty_phase_channel_entry = Entry(order_duty_phase_f, font=('黑体', 15),
+                                         textvariable=duty_phase_channel_var, bg='white', relief='solid',
+                                         width=5, justify='center')
+        duty_phase_channel_unit = Label(order_duty_phase_f, text='号', font=('黑体', 15))
+        duty_phase_channel_label.pack(side='left')
+        duty_phase_channel_entry.pack(side='left')
+        duty_phase_channel_unit.pack(side='left', padx=5)
+        duty_phase_channel_var.set('1')
         # 占空比
-        self.duty_label = Label(order_duty_phase_f, text='占空比:', font=('黑体', 15))
-        self.duty_var = StringVar()
-        self.duty_entry = Entry(order_duty_phase_f, font=('黑体', 15), textvariable=self.duty_var, bg='white',
-                                relief='solid', width=5, justify='center')
-        self.duty_unit = Label(order_duty_phase_f, text='%', font=('黑体', 15))
-        self.duty_label.pack(side='left')
-        self.duty_entry.pack(side='left')
-        self.duty_unit.pack(side='left', padx=5)
-        self.duty_var.set('50')
+        duty_label = Label(order_duty_phase_f, text='占空比:', font=('黑体', 15))
+        duty_var = StringVar()
+        duty_entry = Entry(order_duty_phase_f, font=('黑体', 15), textvariable=duty_var, bg='white',
+                           relief='solid', width=5, justify='center')
+        duty_unit = Label(order_duty_phase_f, text='%', font=('黑体', 15))
+        duty_label.pack(side='left')
+        duty_entry.pack(side='left')
+        duty_unit.pack(side='left', padx=5)
+        duty_var.set('50')
         # 相位
-        self.phase_label = Label(order_duty_phase_f, text='相位:', font=('黑体', 15))
-        self.phase_var = StringVar()
-        self.phase_entry = Entry(order_duty_phase_f, font=('黑体', 15), textvariable=self.phase_var, bg='white',
-                                 relief='solid', width=5, justify='center')
-        self.phase_unit = Label(order_duty_phase_f, text='°', font=('黑体', 15))
-        self.phase_label.pack(side='left')
-        self.phase_entry.pack(side='left')
-        self.phase_unit.pack(side='left', padx=5)
-        self.phase_var.set('0')
+        phase_label = Label(order_duty_phase_f, text='相位:', font=('黑体', 15))
+        phase_var = StringVar()
+        phase_entry = Entry(order_duty_phase_f, font=('黑体', 15), textvariable=phase_var, bg='white',
+                            relief='solid', width=5, justify='center')
+        phase_unit = Label(order_duty_phase_f, text='°', font=('黑体', 15))
+        phase_label.pack(side='left')
+        phase_entry.pack(side='left')
+        phase_unit.pack(side='left', padx=5)
+        phase_var.set('0')
         # 设置占空比和相位
         self.set_duty_phase_button = Button(order_duty_phase_f, state='disabled', text='占空比和相位设置',
                                             font=('黑体', 13),
-                                            command=lambda: self.set_duty_phase(self.duty_phase_channel_var.get(),
-                                                                                self.duty_var.get(),
-                                                                                self.phase_var.get()))
+                                            command=lambda: self.set_duty_phase(duty_phase_channel_var.get(),
+                                                                                duty_var.get(),
+                                                                                phase_var.get()))
         self.set_duty_phase_button.pack(side='left', padx=10)
 
-        ########### 系统状态信息区 ###########
+        # 系统状态信息区
         # 分割线
-        self.message_divider_label = Label(message_f,
-                                           text='系统状态信息-------------------------------------------------------------------',
-                                           font=('黑体', 15))
-        self.message_divider_label.pack()
+        message_divider_label = Label(message_f,
+                                      text='系统状态信息-------------------------------------------------------------------',
+                                      font=('黑体', 15))
+        message_divider_label.pack()
         # 信息框
         self.message_box = ScrolledText(message_f, width=100, height=8, font=('宋体', 10))
         self.message_box.pack(side='left', padx=30, pady=5)
         self.message_box.config(state='disabled')  # 禁止编辑
 
-        ########### 状态栏 ############
-        self.version_label = Label(bottom_f, text='Version:', font=('黑体', 15))
-        self.version_label.pack(side='left')
-        self.version_currently = Label(bottom_f, text=self.current_version, font=('黑体', 15))
-        self.version_currently.pack(side='left')
+        # 状态栏
+        version_label = Label(bottom_f, text='Version:', font=('黑体', 15))
+        version_label.pack(side='left')
+        current_version = get_local_version()
+        version_currently = Label(bottom_f, text=current_version, font=('黑体', 15))
+        version_currently.pack(side='left')
 
-        ########### 显示信息、数据处理 ###########
+        # 显示信息、数据处理
         self.message_display('界面加载完成！', 'green')
         self.message_display('================================')
         self.get_port_list()
-
-
 
 
 if __name__ == '__main__':
