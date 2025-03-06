@@ -41,6 +41,9 @@ class Concert(Frame):
         self.pressure_var = StringVar()  # 管路压力句柄
         self.set_freq_button = None
         self.set_duty_phase_button = None
+        self.close_channel_button = None
+        self.close_channel_window = None
+        self.channels = [IntVar(),IntVar(),IntVar(),IntVar(),IntVar()]
         self.message_box = None
         self.send_queue = queue.Queue()  # 创建发送任务队列
         self.receive_thread = None  # 串口接收后台线程句柄
@@ -67,8 +70,8 @@ class Concert(Frame):
         self.pack()
         root.protocol("WM_DELETE_WINDOW", self.on_closing)  # 窗口关闭事件绑定
         self.create_widget()  # 界面组件创建
-        # excel初始化
-        self.excel_init()
+        # # excel初始化
+        # self.excel_init()
 
     '''更新系统'''
 
@@ -213,8 +216,9 @@ class Concert(Frame):
                 case '00aa0401':
                     # hex_data[16:]中为8路流量数据，要先提取出来,成为8个元素的数组,拿到前6个元素
                     flow_data_array = [int(data[i:i + 2], 16) for i in range(0, len(data), 2)]
-                    flow_values = [i / 25 for i in flow_data_array]
+                    flow_values = [0, 0, 0, 0, 0, 0, 0, 0]
                     # 喷头处流量 公式有Q = 【F+10】/108
+                    # 7516p = 1L 1/7516 * p
                     for i in range(len(flow_data_array) - 3):
                         flow_values[i] = (flow_data_array[i] + 10) / 108
                     # 管路流量1L=596脉冲 瞬时流量特性F=[10Q-4]
@@ -237,6 +241,7 @@ class Concert(Frame):
             self.refresh_button['state'] = 'disabled'
             self.baudrate_choose['state'] = 'disabled'
             self.set_freq_button['state'] = 'normal'
+            self.close_channel_button['state'] = 'normal'
             self.set_duty_phase_button['state'] = 'normal'
 
         def button_permissions_close():
@@ -244,6 +249,7 @@ class Concert(Frame):
             self.refresh_button['state'] = 'normal'
             self.baudrate_choose['state'] = 'normal'
             self.set_freq_button['state'] = 'disabled'
+            self.close_channel_button['state'] = 'disabled'
             self.set_duty_phase_button['state'] = 'disabled'
 
         if self.serial_button['text'] == '打开':
@@ -265,6 +271,9 @@ class Concert(Frame):
                 self.send_thread.start()
                 self.message_display('发送线程打开！', 'green')
                 # excel后台线程打开
+                # excel初始化
+                self.excel_init()
+                self.message_display('Excel文件初始化成功，文件名:' + self.xlsx_name, 'green')
                 self.running_saver = True
                 self.saver_thread = threading.Thread(target=self.saver_thread_func, daemon=True)
                 self.saver_thread.start()
@@ -354,9 +363,34 @@ class Concert(Frame):
             '设置 ' + str(channel) + ' 号电磁阀：占空比：' + str(duty / 10) + '%，相位：' + str(phase / 10) + '°', 'green')
         duty_high_low = [(duty >> 8) & 0xFF, duty & 0xFF]
         phase_high_low = [(phase >> 8) & 0xFF, phase & 0xFF]
-        send_data = [0xAA, 0x01, 0x00, 0x08, 0x1F, 0x00, 0x01, channel, duty_high_low[0], duty_high_low[1],
+        send_data = [0xAA, 0x01, 0x00, 0x08, 0x1F, 0x00, 0x02, channel, duty_high_low[0], duty_high_low[1],
                      phase_high_low[0], phase_high_low[1], 0x00, 0x00, 0x00, 0x00]
         self.send_queue.put(send_data)  # 将发送任务放入队列
+
+    '''关闭通道，打开另一个选择窗口'''
+
+    def close_channel(self):
+        self.close_channel_window = Toplevel(root)
+        self.close_channel_window.title('关闭通道')
+        # 一共5个通道，每个通道提供一个复选框
+        for i in range(5):
+            channel_var = StringVar()
+            channel_var.set('喷头'+str(i + 1)+'号')
+            channel_checkbutton = Checkbutton(self.close_channel_window, font=('黑体',13) ,textvariable=channel_var, variable=self.channels[i])
+            channel_checkbutton.pack()
+        close_channel_ok_button = Button(self.close_channel_window, font=('黑体',13) ,text='确定', command=self.close_channel_window_close)
+        close_channel_ok_button.pack()
+
+    def close_channel_window_close(self):
+        self.close_channel_window.destroy()
+        # 判断self.channels的是否选择上，如果选择上发送关闭指令入队列
+        if self.channels[0].get():
+            send_data = [0xAA, 0x01, 0x00, 0x08, 0x1F, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+            self.send_queue.put(send_data)  # 将关闭任务放入队列
+        for i in range(1,5):
+            if self.channels[i].get():
+                send_data = [0xAA, 0x01, 0x00, 0x08, 0x1F, 0x00, 0x02, i + 2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+                self.send_queue.put(send_data)  # 将关闭任务放入队列
 
     '''读取脉冲计数值'''
 
@@ -371,7 +405,7 @@ class Concert(Frame):
 
     def one_second_timer(self):
         # 定时器可能堆积，导致多个并发定时器运行,在启动新定时器前取消旧的
-        if hasattr(self, 'timer') and self.timer.is_alive():
+        if self.timer is not None and self.timer.is_alive():
             self.timer.cancel()
         self.timer = threading.Timer(1, self.read_flow_values)
         self.timer.start()
@@ -449,7 +483,7 @@ class Concert(Frame):
 
         '''内容区'''
         # 标题
-        title_label = Label(title_f, text='喷雾数据在线监控系统', font=('黑体', 25))
+        title_label = Label(title_f, text='PWM变量喷雾控制上位机软件', font=('黑体', 25))
         title_label.pack()
 
         # 配置区，用于配置串口
@@ -547,6 +581,10 @@ class Concert(Frame):
                                                  command=self.toggle_auto_read_flow)
         auto_send_flow_checkbutton.pack(side='left', padx=5)
         auto_send_flow_var.set(1)
+        # 关闭通道
+        self.close_channel_button = Button(order_freq_f, state='disabled', text='关闭通道', font=('黑体', 13),
+                                           command=self.close_channel)
+        self.close_channel_button.pack(side='left', padx=10)
         # 通道号
         duty_phase_channel_label = Label(order_duty_phase_f, text='通道:', font=('黑体', 15))
         duty_phase_channel_var = StringVar()
@@ -613,6 +651,6 @@ class Concert(Frame):
 if __name__ == '__main__':
     root = Tk()
     root.geometry('900x600')  # 窗口大小
-    root.title('喷雾数据在线监控系统')
+    root.title('PWM变量喷雾控制上位机软件')
     app = Concert(root)
     root.mainloop()
